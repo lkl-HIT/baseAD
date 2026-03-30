@@ -1,8 +1,9 @@
+import csv
 import os
 import logging
 import math
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -21,6 +22,34 @@ from src.foundad import VisionModule
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("evaluator")
+
+
+def _load_completed_eval_rows(
+    csv_path: Path, ckpt_name: str
+) -> Dict[str, Tuple[float, float, float, float]]:
+    """Parse AD_eval.csv: rows for this checkpoint with per-class metrics (latest row wins)."""
+    if not csv_path.is_file():
+        return {}
+    completed: Dict[str, Tuple[float, float, float, float]] = {}
+    with open(csv_path, newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row or len(row) < 6:
+                continue
+            if row[0] == "checkpoint":
+                continue
+            if row[0] != ckpt_name or row[1] == "Mean":
+                continue
+            try:
+                completed[row[1]] = (
+                    float(row[2]),
+                    float(row[3]),
+                    float(row[4]),
+                    float(row[5]),
+                )
+            except ValueError:
+                continue
+    return completed
 
 
 def _build_model(meta: Dict[str, Any]) -> VisionModule:
@@ -66,6 +95,19 @@ def _evaluate_single_ckpt(ckpt: Path, cfg: Dict[str, Any]) -> None:
     
     os.makedirs(Path(cfg["logging"]["folder"]), exist_ok=True)
     csv_path = Path(cfg["logging"]["folder"]) / f"{cfg['logging']['write_tag']}_eval.csv"
+    skip_done = cfg["testing"].get("skip_evaluated_classes", True)
+    completed: Dict[str, Tuple[float, float, float, float]] = {}
+    if skip_done:
+        completed = _load_completed_eval_rows(csv_path, ckpt.name)
+        if len(classnames) > 0 and all(c in completed for c in classnames):
+            logger.info(
+                "All %d classes already evaluated for %s in %s; skipping.",
+                len(classnames),
+                ckpt.name,
+                csv_path,
+            )
+            return
+
     csv_logger = CSVLogger(
         csv_path,
         ("%s", "checkpoint"), ("%s", "class"),
@@ -79,6 +121,23 @@ def _evaluate_single_ckpt(ckpt: Path, cfg: Dict[str, Any]) -> None:
     std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
 
     for cls in classnames:
+        if skip_done and cls in completed:
+            ia, ip, pa, pr = completed[cls]
+            inst_auc.append(ia)
+            inst_aupr.append(ip)
+            pix_auc.append(pa)
+            pro_auc.append(pr)
+            logger.info(
+                "Skipping %s (already in %s) | AUROC_i %.4f | AUPR_i %.4f | AUROC_p %.4f | PRO-AUC %.4f",
+                cls,
+                csv_path.name,
+                ia,
+                ip,
+                pa,
+                pr,
+            )
+            continue
+
         _, loader, _ = build_dataloader(
             mode="test",
             root=cfg["data"]["test_root"],

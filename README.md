@@ -76,6 +76,51 @@ python foundad/main.py mode=train data.batch_size=8 data.dataset=mvtec data.data
 ```
 where `data.dataset` is "mvtec" or "visa", `data.data_name` is the folder name of few-shot samples, `data.data_path` is the path where the few-shot folder is at, `app` is "train_dinov3" or other model configs under `configs/app/`, and `diy_name` (optionally) is the post-fix name of the model saving directory. To adjust the layer, please specify `app.meta.n_layer`.
 
+**Path resolution.** Hydra sets `train_root` to `data.data_path/data.data_name`. Training code loads images from **`train_root/train/`** using `ImageFolder`, so each class must be a subdirectory of `train`, for example:
+
+```text
+${data.data_path}/${data.data_name}/train/<classname>/*.png
+```
+
+**Example (custom root, e.g. AutoDL).** If your few-shot folder lives under `/root/autodl-tmp/dataset` and is named `mvtec_4shot`, run from the repo root:
+
+```bash
+python foundad/src/sample.py source=/root/autodl-tmp/dataset/mvtec target=/root/autodl-tmp/dataset/fewshot/mvtec_4shot seed=42 num_samples=4
+```
+
+```bash
+python foundad/main.py mode=train \
+  data.batch_size=8 \
+  data.dataset=mvtec \
+  data.data_name=mvtec_4shot \
+  data.data_path=/root/autodl-tmp/dataset/fewshot \
+  app=train_dinov3 \
+  diy_name=mvtec_4_test
+```
+```bash
+
+python foundad/main.py mode=AD \
+  data.dataset=mvtec \
+  data.data_name=mvtec_4shot \
+  diy_name=mvtec_4_test \
+  data.test_root=<你的MVTec完整数据集路径> \
+  app=test \
+  app.ckpt_step=<你保存的步数>
+
+
+python foundad/main.py mode=AD \
+  data.dataset=visa \
+  data.data_name=visa_4shot \
+  diy_name=visa_4_test \
+  data.test_root=/root/autodl-tmp/dataset/visa/visa_pytorch \
+  app=test \
+  app.ckpt_step=12000
+
+
+```
+
+The name `data.data_name` must contain the dataset tag (`mvtec` or `visa`) because the code checks `dataset in data_name`. Checkpoints and logs go under `logs/<data_name>/dinov3<diy_name>/` (see `foundad/configs/app/train_dinov3.yaml`).
+
 ### Anomaly Detection / Inference
 
 After training, run inference:

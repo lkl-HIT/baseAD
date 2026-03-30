@@ -10,7 +10,7 @@ mode: train
 
 data:
   batch_size: 8
-  num_workers: 0
+  num_workers: 4
   pin_mem: true
   dataset: dataset-name
   data_name: fewshot-folder-name
@@ -58,6 +58,8 @@ data:
 optimization:
   weight_decay: 1e-4
   epochs: 2000
+  # Write train-step{N}.pth.tar every N global optimizer steps (not per-epoch itr). 0 = disable.
+  save_every_steps: 1000
   lr: 0.001
   lr_config: const # const, cosine, step, cosine_warmup
   min_lr: 1e-4 # for cosine and cosine_warmup
@@ -73,6 +75,8 @@ testing:
   expect_fpr: 0.3     
   max_steps: 200      
   segmentation_vis: True
+  # Resume AD eval: skip classes already present in *_eval.csv for this checkpoint
+  skip_evaluated_classes: true
 
 devices: [cuda:0]
 

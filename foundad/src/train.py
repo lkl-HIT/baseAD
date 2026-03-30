@@ -77,6 +77,8 @@ class Trainer:
             gamma=ocfg.get("gamma", 0.1),                     # for step
         )
         self.epochs = ocfg["epochs"]
+        # Global-step checkpoint interval for train-step{N}.pth.tar; 0 disables periodic saves
+        self.save_every_steps = int(ocfg.get("save_every_steps", 100))
         self.use_bf16 = mcfg["use_bfloat16"]
 
         # ---------- logging ----------
@@ -93,6 +95,10 @@ class Trainer:
             ("%d", "itr"),
             ("%.5f", "loss"),
             ("%d", "time (ms)"),
+        )
+        logger.info(
+            "save_every_steps=%s (periodic checkpoint train-step{N}.pth.tar; 0=disabled)",
+            self.save_every_steps,
         )
 
     def _loss_fn(self, h, p) -> torch.Tensor:
@@ -128,7 +134,8 @@ class Trainer:
                 else: loss.backward(); self.optimizer.step()
                 grad_stats = grad_logger(self.model.predictor.named_parameters()); self.optimizer.zero_grad()
                 loss_m.update(loss.item()); time_m.update(t); gstep += 1
-                if gstep % 100 == 0: self._save_ckpt(ep, gstep)
+                if self.save_every_steps > 0 and gstep % self.save_every_steps == 0:
+                    self._save_ckpt(ep, gstep)
                 self.csv_logger.log(ep+1, itr, loss.item(), t)
                 if itr % 100 == 0:
                     logger.info("[E %d I %d] loss %.6f (avg %.6f) mem %.2fMB (%.1fms)", ep+1, itr, loss.item(), loss_m.avg, torch.cuda.max_memory_allocated()/1024**2, time_m.avg)

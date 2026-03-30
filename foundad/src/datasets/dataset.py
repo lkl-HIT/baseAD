@@ -10,6 +10,26 @@ import PIL
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
+# Test / mask loading: ignore dirs (e.g. .ipynb_checkpoints) and non-image files
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+
+# VisA (e.g. RealNet layout): normal images may live under ``test/.../ok`` or ``.../good`` like MVTec.
+_VISA_NORMAL_ANOMALIES = frozenset(("ok", "good"))
+
+
+def _is_image_file(path: str) -> bool:
+    if not os.path.isfile(path):
+        return False
+    ext = os.path.splitext(path)[1].lower()
+    return ext in _IMAGE_EXTS
+
+
+def _list_image_files(dirpath: str) -> list:
+    if not os.path.isdir(dirpath):
+        return []
+    names = sorted(os.listdir(dirpath))
+    return [os.path.join(dirpath, x) for x in names if _is_image_file(os.path.join(dirpath, x))]
+
 class RandomRotate90or270:
     def __init__(self, p=0.3):
         self.p = p
@@ -248,35 +268,33 @@ class TestDataset(Dataset):
         for classname in self.classnames_to_use:
             classpath = os.path.join(self.source, classname, "test")
             maskpath = os.path.join(self.source, classname, "ground_truth")
-            anomaly_types = os.listdir(classpath)
+            anomaly_types = sorted(
+                x for x in os.listdir(classpath)
+                if os.path.isdir(os.path.join(classpath, x))
+            )
 
             imgpaths_per_class[classname] = {}
             maskpaths_per_class[classname] = {}
 
             for anomaly in anomaly_types:
                 anomaly_path = os.path.join(classpath, anomaly)
-                anomaly_files = sorted(os.listdir(anomaly_path))
-                imgpaths_per_class[classname][anomaly] = [
-                    os.path.join(anomaly_path, x) for x in anomaly_files
-                ]
+                imgpaths_per_class[classname][anomaly] = _list_image_files(anomaly_path)
                 if self.datasetname == "mvtec":
                     if  anomaly != "good":
                         anomaly_mask_path = os.path.join(maskpath, anomaly)
-                        anomaly_mask_files = sorted(os.listdir(anomaly_mask_path))
-                        maskpaths_per_class[classname][anomaly] = [
-                            os.path.join(anomaly_mask_path, x) for x in anomaly_mask_files
-                        ]
+                        maskpaths_per_class[classname][anomaly] = _list_image_files(
+                            anomaly_mask_path
+                        )
                     else:
                         maskpaths_per_class[classname]["good"] = None
                 elif self.datasetname == "visa":
-                    if  anomaly != "ok":
+                    if anomaly not in _VISA_NORMAL_ANOMALIES:
                         anomaly_mask_path = os.path.join(maskpath, anomaly)
-                        anomaly_mask_files = sorted(os.listdir(anomaly_mask_path))
-                        maskpaths_per_class[classname][anomaly] = [
-                            os.path.join(anomaly_mask_path, x) for x in anomaly_mask_files
-                        ]
+                        maskpaths_per_class[classname][anomaly] = _list_image_files(
+                            anomaly_mask_path
+                        )
                     else:
-                        maskpaths_per_class[classname]["ok"] = None
+                        maskpaths_per_class[classname][anomaly] = None
 
         # Unrolls the data dictionary to an easy-to-iterate list.
         data_to_iterate = []
@@ -290,7 +308,7 @@ class TestDataset(Dataset):
                         else:
                             data_tuple.append(None)
                     elif self.datasetname == "visa":
-                        if anomaly != "ok":
+                        if anomaly not in _VISA_NORMAL_ANOMALIES:
                             data_tuple.append(maskpaths_per_class[classname][anomaly][i])
                         else:
                             data_tuple.append(None)
