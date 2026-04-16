@@ -55,7 +55,7 @@ class VisionModule(nn.Module):
         if model == "dinov2":
             enc = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14").eval(); num_patches, embed_dim = enc.patch_embed.num_patches, enc.embed_dim
         elif model == "dinov3":
-            enc = torch.hub.load("facebookresearch/dinov3", 'dinov3_vitb16', source="github").eval()
+            enc = torch.hub.load("/root/.cache/torch/hub/facebookresearch_dinov3_main", 'dinov3_vitb16', source="local").eval()
             num_patches, embed_dim = enc.patch_embed.num_patches, enc.embed_dim
         elif model == "dino":
             enc = torch.hub.load("facebookresearch/dino:main", "dino_vitb16").eval(); num_patches, embed_dim = 1024, enc.embed_dim
