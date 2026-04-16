@@ -8,6 +8,11 @@ diy_name: "_pretrained"
 # train / AD
 mode: train
 
+# Experiment mode: periodic eval during training, no checkpoint saving
+experiment:
+  enabled: false
+  eval_every_n_epochs: 100
+
 data:
   batch_size: 8
   num_workers: 4

@@ -52,6 +52,11 @@ def process_main(rank: int, cfg_dict: dict, world_size: int):
     )
 
     if mode == "train":
+        if params.get("experiment", {}).get("enabled", False):
+            params["logging"]["folder"] = os.path.join(
+                "experiment", params["logging"]["folder"]
+            )
+
         if rank==0:
             log_dir = params["logging"]["folder"]
             os.makedirs(log_dir, exist_ok=True)

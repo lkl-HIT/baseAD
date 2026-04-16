@@ -81,14 +81,18 @@ class Trainer:
         self.save_every_steps = int(ocfg.get("save_every_steps", 100))
         self.use_bf16 = mcfg["use_bfloat16"]
 
+        # ---------- experiment mode ----------
+        exp_cfg = args.get("experiment", {})
+        self.experiment_mode = exp_cfg.get("enabled", False)
+        self.eval_every_n_epochs = int(exp_cfg.get("eval_every_n_epochs", 100))
+
         # ---------- logging ----------
         lcfg: Dict[str, Any] = args.get("logging", {})
         log_dir = Path(lcfg.get("folder", "logs"))
-        # log_dir.mkdir(parents=True, exist_ok=True)     
         self.ckpt_dir = log_dir
 
-        self.tag = lcfg.get("write_tag", "train")      
-        
+        self.tag = lcfg.get("write_tag", "train")
+
         self.csv_logger = CSVLogger(
             str(self.ckpt_dir / f"{self.tag}.csv"),
             ("%d", "epoch"),
@@ -96,10 +100,23 @@ class Trainer:
             ("%.5f", "loss"),
             ("%d", "time (ms)"),
         )
-        logger.info(
-            "save_every_steps=%s (periodic checkpoint train-step{N}.pth.tar; 0=disabled)",
-            self.save_every_steps,
-        )
+
+        if self.experiment_mode:
+            self.eval_csv_logger = CSVLogger(
+                str(self.ckpt_dir / "eval.csv"),
+                ("%d", "epoch"), ("%s", "class"),
+                ("%.8f", "inst_auroc"), ("%.8f", "inst_aupr"),
+                ("%.8f", "pix_auroc"),  ("%.8f", "pro_auc"),
+            )
+            logger.info(
+                "*** Experiment mode ON: eval every %d epochs, checkpoint saving DISABLED ***",
+                self.eval_every_n_epochs,
+            )
+        else:
+            logger.info(
+                "save_every_steps=%s (periodic checkpoint train-step{N}.pth.tar; 0=disabled)",
+                self.save_every_steps,
+            )
 
     def _loss_fn(self, h, p) -> torch.Tensor:
         if self.loss_mode == 'l2':
@@ -114,6 +131,26 @@ class Trainer:
         torch.save({"predictor": self.model.predictor.state_dict(),
                     "projector": self.model.projector.state_dict() if self.model.projector else None,
                     "epoch": ep, "lr": self.optimizer.param_groups[0]["lr"]}, self.ckpt_dir/name)
+
+    def _run_experiment_eval(self, epoch):
+        from src.AD import evaluate_model
+        logger.info("=" * 60)
+        logger.info("[Experiment] Running evaluation at epoch %d ...", epoch)
+        logger.info("=" * 60)
+        results = evaluate_model(
+            self.model, self.args,
+            csv_logger=self.eval_csv_logger, epoch=epoch,
+        )
+        logger.info("=" * 60)
+        logger.info(
+            "[Experiment] Epoch %d  Mean AUROC_i %.4f | AUPR_i %.4f | AUROC_p %.4f | PRO-AUC %.4f",
+            epoch, results["inst_auroc"], results["inst_aupr"],
+            results["pix_auroc"], results["pro_auc"],
+        )
+        logger.info("=" * 60)
+        self.model.predictor.train()
+        if self.model.projector:
+            self.model.projector.train()
 
     def train(self):
         mp.set_start_method("spawn", force=True); gstep = 0
@@ -134,7 +171,7 @@ class Trainer:
                 else: loss.backward(); self.optimizer.step()
                 grad_stats = grad_logger(self.model.predictor.named_parameters()); self.optimizer.zero_grad()
                 loss_m.update(loss.item()); time_m.update(t); gstep += 1
-                if self.save_every_steps > 0 and gstep % self.save_every_steps == 0:
+                if not self.experiment_mode and self.save_every_steps > 0 and gstep % self.save_every_steps == 0:
                     self._save_ckpt(ep, gstep)
                 self.csv_logger.log(ep+1, itr, loss.item(), t)
                 if itr % 100 == 0:
@@ -149,6 +186,9 @@ class Trainer:
             )
             if self.scheduler is not None:
                 self.scheduler.step()
+
+            if self.experiment_mode and (ep + 1) % self.eval_every_n_epochs == 0:
+                self._run_experiment_eval(ep + 1)
 
 def main(args: Dict[str, Any]) -> None:
     if args is None:

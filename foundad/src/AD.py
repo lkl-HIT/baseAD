@@ -295,6 +295,108 @@ def _demo(ckpt: Path, cfg: Dict[str, Any]) -> None:
         print(f"[{i}/{len(img_paths)}] Saved: {save_path}")
 
 
+@torch.inference_mode()
+def evaluate_model(model, cfg, csv_logger=None, epoch=None):
+    """Evaluate model in-place (no checkpoint I/O). Returns dict of mean metrics."""
+    device = next(model.parameters()).device
+    model.eval()
+
+    crop = cfg["meta"]["crop_size"]
+    n_layer = cfg["meta"].get("n_layer", 3)
+
+    dataset_name = cfg["data"].get("dataset", "mvtec")
+    if dataset_name == "mvtec":
+        classnames = cfg["data"]["mvtec_classnames"]
+        K = cfg["testing"]["K_top_mvtec"]
+    elif dataset_name == "visa":
+        classnames = cfg["data"]["visa_classnames"]
+        K = cfg["testing"]["K_top_visa"]
+    else:
+        raise NotImplementedError(f"Unknown dataset: {dataset_name}")
+
+    inst_auc, inst_aupr, pix_auc, pro_auc_list = [], [], [], []
+
+    for cls in classnames:
+        _, loader, _ = build_dataloader(
+            mode="test",
+            root=cfg["data"]["test_root"],
+            batch_size=1,
+            classname=cls,
+            resize=crop,
+            datasetname=dataset_name,
+        )
+
+        patch_scores, labels = [], []
+        pix_buf, mask_buf = [], []
+
+        for batch in loader:
+            img = batch["image"].to(device, non_blocking=True)
+            mask = batch["mask"].to(device, non_blocking=True)
+            paths = batch["image_path"]
+            labels.extend(batch["is_anomaly"])
+
+            enc = model.target_features(img, paths, n_layer=n_layer)
+            pred = model.predict(enc)
+
+            l = F.mse_loss(enc, pred, reduction="none").mean(dim=2)
+            topk = torch.topk(l, K, dim=1).values.mean(dim=1)
+            patch_scores.extend(topk.cpu())
+
+            h = w = int(math.sqrt(l.size(1)))
+            pix = F.interpolate(
+                l.view(-1, 1, h, w), size=img.shape[2:],
+                mode="bilinear", align_corners=False,
+            )
+            pix_buf.append(pix.squeeze(1).cpu())
+            mask_buf.append(mask.cpu())
+
+        p_np = torch.tensor(patch_scores).numpy()
+        p_np = (p_np - p_np.min()) / (p_np.max() - p_np.min() + 1e-8)
+
+        pix_all = torch.cat(pix_buf)
+        gmin, gmax = pix_all.min(), pix_all.max()
+        pix_norm = ((pix_all - gmin) / (gmax - gmin + 1e-8)).numpy()
+        mask_np = torch.cat(mask_buf).squeeze(1).numpy()
+
+        inst = compute_imagewise_retrieval_metrics(p_np, np.array(labels))
+        pix_met = compute_pixelwise_retrieval_metrics(pix_norm, mask_np)
+        pro = calculate_pro(
+            mask_np, pix_norm,
+            max_steps=cfg["testing"]["max_steps"],
+            expect_fpr=cfg["testing"]["expect_fpr"],
+        )
+
+        logger.info(
+            "  %s | AUROC_i %.4f | AUPR_i %.4f | AUROC_p %.4f | PRO-AUC %.4f",
+            cls, inst["auroc"], inst["aupr"], pix_met["auroc"], pro,
+        )
+        if csv_logger is not None and epoch is not None:
+            csv_logger.log(epoch, cls, inst["auroc"], inst["aupr"], pix_met["auroc"], pro)
+
+        inst_auc.append(inst["auroc"])
+        inst_aupr.append(inst["aupr"])
+        pix_auc.append(pix_met["auroc"])
+        pro_auc_list.append(pro)
+
+    means = {
+        "inst_auroc": float(np.mean(inst_auc)),
+        "inst_aupr": float(np.mean(inst_aupr)),
+        "pix_auroc": float(np.mean(pix_auc)),
+        "pro_auc": float(np.mean(pro_auc_list)),
+    }
+
+    logger.info(
+        "  Mean | AUROC_i %.4f | AUPR_i %.4f | AUROC_p %.4f | PRO-AUC %.4f",
+        means["inst_auroc"], means["inst_aupr"], means["pix_auroc"], means["pro_auc"],
+    )
+    if csv_logger is not None and epoch is not None:
+        csv_logger.log(epoch, "Mean",
+                       means["inst_auroc"], means["inst_aupr"],
+                       means["pix_auroc"], means["pro_auc"])
+
+    return means
+
+
 def main(args: Dict[str, Any]) -> None:
     ckpt = Path(args["ckpt_path"])
     print(f"loading {ckpt}...")
