@@ -6,8 +6,6 @@ import pprint
 import yaml
 import torch
 
-from src.train import main as app_main_mvtec
-from src.AD import main as AD, _demo
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -51,6 +49,10 @@ def process_main(rank: int, cfg_dict: dict, world_size: int):
         rank=rank
     )
 
+    from src.train import main as app_main
+    from src.AD import main as ad_eval
+    from src.AD import _demo as ad_demo
+
     if mode == "train":
         if params.get("experiment", {}).get("enabled", False):
             params["logging"]["folder"] = os.path.join(
@@ -65,7 +67,7 @@ def process_main(rank: int, cfg_dict: dict, world_size: int):
                 yaml.safe_dump(params, f, default_flow_style=False, sort_keys=False)
             print(f"Config saved to {params_save_path}")
 
-        app_main_mvtec(args=params)
+        app_main(args=params)
     elif mode == "AD":
         load_path = os.path.join('logs', cfg_dict['data']['data_name'], params.get('model_name','')+cfg_dict['diy_name'])
         saved_path = os.path.join(load_path,"params.yaml")
@@ -76,7 +78,7 @@ def process_main(rank: int, cfg_dict: dict, world_size: int):
                 params['meta'] = saved_params['meta']
                 params["ckpt_path"] = os.path.join(saved_params["logging"]["folder"],f"train-step{params['ckpt_step']}.pth.tar")
                 params["logging"]["folder"] = os.path.join(saved_params["logging"]["folder"],f"eval/{str(params['ckpt_step'])}")
-            AD(args=params)
+            ad_eval(args=params)
         else:
             print("No ckpt path is found.")
     elif mode == "demo":
@@ -90,7 +92,7 @@ def process_main(rank: int, cfg_dict: dict, world_size: int):
                 params["ckpt_path"] = os.path.join(saved_params["logging"]["folder"],f"pretrained.pth.tar")
                 params["logging"]["folder"] = os.path.join(saved_params["logging"]["folder"],"demo")
             print(f"loading {params['ckpt_path']}...")
-            _demo(params["ckpt_path"], params)
+            ad_demo(params["ckpt_path"], params)
         else:
             print("No ckpt is found.")
     else:

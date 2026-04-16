@@ -11,11 +11,7 @@ from matplotlib import cm, pyplot as plt
 from PIL import Image
 
 from src.datasets.dataset import build_dataloader
-from src.utils.metrics import (
-    calculate_pro,
-    compute_imagewise_retrieval_metrics,
-    compute_pixelwise_retrieval_metrics,
-)
+from src.utils.metrics import compute_ad_metrics_gpu
 from src.helper import save_segmentation_grid
 from src.utils.logging import CSVLogger
 from src.foundad import VisionModule          
@@ -100,12 +96,16 @@ def _evaluate_single_ckpt(ckpt: Path, cfg: Dict[str, Any]) -> None:
     if skip_done:
         completed = _load_completed_eval_rows(csv_path, ckpt.name)
         if len(classnames) > 0 and all(c in completed for c in classnames):
+            ia = [completed[c][0] for c in classnames]
+            ip = [completed[c][1] for c in classnames]
+            pa = [completed[c][2] for c in classnames]
+            pr = [completed[c][3] for c in classnames]
             logger.info(
-                "All %d classes already evaluated for %s in %s; skipping.",
-                len(classnames),
-                ckpt.name,
-                csv_path,
+                "All %d classes already evaluated for %s in %s.",
+                len(classnames), ckpt.name, csv_path,
             )
+            logger.info("Mean | AUROC_i %.4f | AUPR_i %.4f | AUROC_p %.4f | PRO-AUC %.4f",
+                        np.mean(ia), np.mean(ip), np.mean(pa), np.mean(pr))
             return
 
     csv_logger = CSVLogger(
@@ -176,17 +176,17 @@ def _evaluate_single_ckpt(ckpt: Path, cfg: Dict[str, Any]) -> None:
         pix_norm = ((pix_all - gmin) / (gmax - gmin + 1e-8)).numpy()
         mask_np  = torch.cat(mask_buf).squeeze(1).numpy()
 
-        inst = compute_imagewise_retrieval_metrics(p_np, np.array(labels))
-        pix  = compute_pixelwise_retrieval_metrics(pix_norm, mask_np)
-        pro  = calculate_pro(mask_np, pix_norm,
-                             max_steps=cfg["testing"]["max_steps"], expect_fpr=cfg["testing"]["expect_fpr"])
+        met = compute_ad_metrics_gpu(
+            p_np, np.array(labels), pix_norm, mask_np,
+            nstrips=cfg["testing"]["max_steps"],
+        )
 
         logger.info("%s | AUROC_i %.4f | AUPR_i %.4f | AUROC_p %.4f | PRO-AUC %.4f",
-                    cls, inst["auroc"], inst["aupr"], pix["auroc"], pro)
-        csv_logger.log(ckpt.name, cls, inst["auroc"], inst["aupr"], pix["auroc"], pro)
+                    cls, met["inst_auroc"], met["inst_aupr"], met["pix_auroc"], met["pro_auc"])
+        csv_logger.log(ckpt.name, cls, met["inst_auroc"], met["inst_aupr"], met["pix_auroc"], met["pro_auc"])
 
-        inst_auc.append(inst["auroc"]); inst_aupr.append(inst["aupr"])
-        pix_auc.append(pix["auroc"]);   pro_auc.append(pro)
+        inst_auc.append(met["inst_auroc"]); inst_aupr.append(met["inst_aupr"])
+        pix_auc.append(met["pix_auroc"]);   pro_auc.append(met["pro_auc"])
 
         # Generate visualizations
         if cfg["testing"].get("segmentation_vis", False):
@@ -195,8 +195,10 @@ def _evaluate_single_ckpt(ckpt: Path, cfg: Dict[str, Any]) -> None:
             out_dir = Path(cfg["logging"]["folder"]) / "segmentation" / cls
             save_segmentation_grid(out_dir, name_buf, imgs_un, mask_np, pix_norm)
 
+    logger.info("=" * 60)
     logger.info("Mean | AUROC_i %.4f | AUPR_i %.4f | AUROC_p %.4f | PRO-AUC %.4f",
                 np.mean(inst_auc), np.mean(inst_aupr), np.mean(pix_auc), np.mean(pro_auc))
+    logger.info("=" * 60)
     csv_logger.log(ckpt.name, "Mean", np.mean(inst_auc), np.mean(inst_aupr),
                    np.mean(pix_auc), np.mean(pro_auc))
     
@@ -358,25 +360,22 @@ def evaluate_model(model, cfg, csv_logger=None, epoch=None):
         pix_norm = ((pix_all - gmin) / (gmax - gmin + 1e-8)).numpy()
         mask_np = torch.cat(mask_buf).squeeze(1).numpy()
 
-        inst = compute_imagewise_retrieval_metrics(p_np, np.array(labels))
-        pix_met = compute_pixelwise_retrieval_metrics(pix_norm, mask_np)
-        pro = calculate_pro(
-            mask_np, pix_norm,
-            max_steps=cfg["testing"]["max_steps"],
-            expect_fpr=cfg["testing"]["expect_fpr"],
+        met = compute_ad_metrics_gpu(
+            p_np, np.array(labels), pix_norm, mask_np,
+            nstrips=cfg["testing"]["max_steps"],
         )
 
         logger.info(
             "  %s | AUROC_i %.4f | AUPR_i %.4f | AUROC_p %.4f | PRO-AUC %.4f",
-            cls, inst["auroc"], inst["aupr"], pix_met["auroc"], pro,
+            cls, met["inst_auroc"], met["inst_aupr"], met["pix_auroc"], met["pro_auc"],
         )
         if csv_logger is not None and epoch is not None:
-            csv_logger.log(epoch, cls, inst["auroc"], inst["aupr"], pix_met["auroc"], pro)
+            csv_logger.log(epoch, cls, met["inst_auroc"], met["inst_aupr"], met["pix_auroc"], met["pro_auc"])
 
-        inst_auc.append(inst["auroc"])
-        inst_aupr.append(inst["aupr"])
-        pix_auc.append(pix_met["auroc"])
-        pro_auc_list.append(pro)
+        inst_auc.append(met["inst_auroc"])
+        inst_aupr.append(met["inst_aupr"])
+        pix_auc.append(met["pix_auroc"])
+        pro_auc_list.append(met["pro_auc"])
 
     means = {
         "inst_auroc": float(np.mean(inst_auc)),
