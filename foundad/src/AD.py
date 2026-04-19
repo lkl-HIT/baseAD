@@ -14,7 +14,8 @@ from src.datasets.dataset import build_dataloader
 from src.utils.metrics import compute_ad_metrics_gpu
 from src.helper import save_segmentation_grid
 from src.utils.logging import CSVLogger
-from src.foundad import VisionModule          
+from src.foundad import VisionModule
+from src.utils.pca import PCAScorer
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger("evaluator")
@@ -55,7 +56,58 @@ def _build_model(meta: Dict[str, Any]) -> VisionModule:
         pred_emb_dim=meta["pred_emb_dim"],
         if_pe=meta.get("if_pred_pe", True),
         feat_normed=meta.get("feat_normed", False),
+        multi_layer_agg=meta.get("multi_layer_agg", "none"),
     )
+
+
+def _collect_normal_features(model, train_root, cls, crop, n_layer, device, n_aug=3):
+    """Extract normal patch features for PCA fitting with rotation augmentation."""
+    import torchvision.transforms as T
+    from PIL import Image as PILImage
+
+    img_dir = os.path.join(train_root, "train", cls)
+    if not os.path.isdir(img_dir):
+        logger.warning("PCA: train dir not found: %s", img_dir)
+        return None
+
+    exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+    img_paths = sorted(
+        p for p in (os.path.join(img_dir, f) for f in os.listdir(img_dir))
+        if os.path.isfile(p) and os.path.splitext(p)[1].lower() in exts
+    )
+    if not img_paths:
+        logger.warning("PCA: no images in %s", img_dir)
+        return None
+
+    transform = T.Compose([
+        T.Resize((crop, crop)),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
+
+    angles = [0.0]
+    if n_aug > 0:
+        step = 360.0 / (n_aug + 1)
+        angles += [step * i for i in range(1, n_aug + 1)]
+
+    all_feats = []
+    for angle in angles:
+        batch = []
+        for p in img_paths:
+            pil = PILImage.open(p).convert("RGB")
+            if angle > 0:
+                pil = pil.rotate(angle, expand=False, fillcolor=(0, 0, 0))
+            batch.append(transform(pil))
+        imgs = torch.stack(batch).to(device)
+        enc = model.target_features(imgs, img_paths, n_layer=n_layer)
+        all_feats.append(enc.reshape(-1, enc.size(-1)).cpu())
+
+    features = torch.cat(all_feats, dim=0)
+    logger.info(
+        "PCA [%s]: collected %d patch features (n_img=%d, n_aug=%d)",
+        cls, features.size(0), len(img_paths), n_aug,
+    )
+    return features
 
 @torch.inference_mode()
 def _evaluate_single_ckpt(ckpt: Path, cfg: Dict[str, Any]) -> None:
@@ -73,7 +125,13 @@ def _evaluate_single_ckpt(ckpt: Path, cfg: Dict[str, Any]) -> None:
     crop = cfg["meta"]["crop_size"]
     n_layer = cfg["meta"].get("n_layer", 3)
 
-    # error = cfg["meta"].get("loss_mode", "l2")
+    top_ratio = cfg["testing"].get("top_ratio")
+    pca_cfg = cfg.get("testing", {}).get("pca", {})
+    use_pca = pca_cfg.get("enabled", False)
+    pca_ev_ratio = pca_cfg.get("ev_ratio", 0.99)
+    pca_weight = pca_cfg.get("score_weight", 0.3)
+    pca_n_aug = pca_cfg.get("n_aug", 3)
+    train_root = cfg.get("data", {}).get("train_root")
 
     dataset_name = cfg["data"].get("dataset", "mvtec")
     if dataset_name == 'mvtec':
@@ -149,8 +207,14 @@ def _evaluate_single_ckpt(ckpt: Path, cfg: Dict[str, Any]) -> None:
 
         print(f"Evaluating {cls}...")
 
-        patch_scores, labels = [], []
-        pix_buf, img_buf, mask_buf, name_buf = [], [], [], []
+        pca_scorer = None
+        if use_pca and train_root:
+            feats = _collect_normal_features(model, train_root, cls, crop, n_layer, device, n_aug=pca_n_aug)
+            if feats is not None:
+                pca_scorer = PCAScorer(ev_ratio=pca_ev_ratio, device=device).fit(feats)
+
+        foundad_img_scores, pca_img_scores, labels = [], [], []
+        foundad_pix_buf, pca_pix_buf, img_buf, mask_buf, name_buf = [], [], [], [], []
 
         for batch in loader:
             img = batch["image"].to(device, non_blocking=True)
@@ -162,19 +226,40 @@ def _evaluate_single_ckpt(ckpt: Path, cfg: Dict[str, Any]) -> None:
 
             l = F.mse_loss(enc, pred, reduction="none").mean(dim=2)
 
-            topk = torch.topk(l, K, dim=1).values.mean(dim=1)
-            patch_scores.extend(topk.cpu())
+            n_top = max(1, int(l.size(1) * top_ratio)) if top_ratio is not None else K
+            topk = torch.topk(l, n_top, dim=1).values.mean(dim=1)
+            foundad_img_scores.extend(topk.cpu())
             h = w = int(math.sqrt(l.size(1)))
             pix = F.interpolate(l.view(-1,1,h,w), size=img.shape[2:], mode="bilinear", align_corners=False)
-            pix_buf.append(pix.squeeze(1).cpu()); img_buf.append(img.cpu()); mask_buf.append(mask.cpu())
+            foundad_pix_buf.append(pix.squeeze(1).cpu()); img_buf.append(img.cpu()); mask_buf.append(mask.cpu())
 
-        p_np = torch.tensor(patch_scores).numpy()
-        p_np = (p_np - p_np.min()) / (p_np.max() - p_np.min() + 1e-8) # normed
+            if pca_scorer is not None:
+                l_pca = pca_scorer.score(enc)
+                topk_pca = torch.topk(l_pca, n_top, dim=1).values.mean(dim=1)
+                pca_img_scores.extend(topk_pca.cpu())
+                pix_pca = F.interpolate(l_pca.view(-1,1,h,w), size=img.shape[2:], mode="bilinear", align_corners=False)
+                pca_pix_buf.append(pix_pca.squeeze(1).cpu())
 
-        pix_all = torch.cat(pix_buf)
-        gmin, gmax = pix_all.min(), pix_all.max()
-        pix_norm = ((pix_all - gmin) / (gmax - gmin + 1e-8)).numpy()
-        mask_np  = torch.cat(mask_buf).squeeze(1).numpy()
+        fi = torch.tensor(foundad_img_scores).numpy()
+        fi = (fi - fi.min()) / (fi.max() - fi.min() + 1e-8)
+        fp_all = torch.cat(foundad_pix_buf)
+        fp_min, fp_max = fp_all.min(), fp_all.max()
+        fp_norm = ((fp_all - fp_min) / (fp_max - fp_min + 1e-8)).numpy()
+
+        if pca_scorer is not None:
+            pi = torch.tensor(pca_img_scores).numpy()
+            pi = (pi - pi.min()) / (pi.max() - pi.min() + 1e-8)
+            pp_all = torch.cat(pca_pix_buf)
+            pp_min, pp_max = pp_all.min(), pp_all.max()
+            pp_norm = ((pp_all - pp_min) / (pp_max - pp_min + 1e-8)).numpy()
+            alpha = pca_weight
+            p_np = (1 - alpha) * fi + alpha * pi
+            pix_norm = (1 - alpha) * fp_norm + alpha * pp_norm
+        else:
+            p_np = fi
+            pix_norm = fp_norm
+
+        mask_np = torch.cat(mask_buf).squeeze(1).numpy()
 
         met = compute_ad_metrics_gpu(
             p_np, np.array(labels), pix_norm, mask_np,
@@ -306,6 +391,14 @@ def evaluate_model(model, cfg, csv_logger=None, epoch=None):
     crop = cfg["meta"]["crop_size"]
     n_layer = cfg["meta"].get("n_layer", 3)
 
+    top_ratio = cfg["testing"].get("top_ratio")
+    pca_cfg = cfg.get("testing", {}).get("pca", {})
+    use_pca = pca_cfg.get("enabled", False)
+    pca_ev_ratio = pca_cfg.get("ev_ratio", 0.99)
+    pca_weight = pca_cfg.get("score_weight", 0.3)
+    pca_n_aug = pca_cfg.get("n_aug", 3)
+    train_root = cfg.get("data", {}).get("train_root")
+
     dataset_name = cfg["data"].get("dataset", "mvtec")
     if dataset_name == "mvtec":
         classnames = cfg["data"]["mvtec_classnames"]
@@ -328,8 +421,14 @@ def evaluate_model(model, cfg, csv_logger=None, epoch=None):
             datasetname=dataset_name,
         )
 
-        patch_scores, labels = [], []
-        pix_buf, mask_buf = [], []
+        pca_scorer = None
+        if use_pca and train_root:
+            feats = _collect_normal_features(model, train_root, cls, crop, n_layer, device, n_aug=pca_n_aug)
+            if feats is not None:
+                pca_scorer = PCAScorer(ev_ratio=pca_ev_ratio, device=device).fit(feats)
+
+        foundad_img_scores, pca_img_scores, labels = [], [], []
+        foundad_pix_buf, pca_pix_buf, mask_buf = [], [], []
 
         for batch in loader:
             img = batch["image"].to(device, non_blocking=True)
@@ -341,23 +440,47 @@ def evaluate_model(model, cfg, csv_logger=None, epoch=None):
             pred = model.predict(enc)
 
             l = F.mse_loss(enc, pred, reduction="none").mean(dim=2)
-            topk = torch.topk(l, K, dim=1).values.mean(dim=1)
-            patch_scores.extend(topk.cpu())
+            n_top = max(1, int(l.size(1) * top_ratio)) if top_ratio is not None else K
+            topk = torch.topk(l, n_top, dim=1).values.mean(dim=1)
+            foundad_img_scores.extend(topk.cpu())
 
             h = w = int(math.sqrt(l.size(1)))
             pix = F.interpolate(
                 l.view(-1, 1, h, w), size=img.shape[2:],
                 mode="bilinear", align_corners=False,
             )
-            pix_buf.append(pix.squeeze(1).cpu())
+            foundad_pix_buf.append(pix.squeeze(1).cpu())
             mask_buf.append(mask.cpu())
 
-        p_np = torch.tensor(patch_scores).numpy()
-        p_np = (p_np - p_np.min()) / (p_np.max() - p_np.min() + 1e-8)
+            if pca_scorer is not None:
+                l_pca = pca_scorer.score(enc)
+                topk_pca = torch.topk(l_pca, n_top, dim=1).values.mean(dim=1)
+                pca_img_scores.extend(topk_pca.cpu())
+                pix_pca = F.interpolate(
+                    l_pca.view(-1, 1, h, w), size=img.shape[2:],
+                    mode="bilinear", align_corners=False,
+                )
+                pca_pix_buf.append(pix_pca.squeeze(1).cpu())
 
-        pix_all = torch.cat(pix_buf)
-        gmin, gmax = pix_all.min(), pix_all.max()
-        pix_norm = ((pix_all - gmin) / (gmax - gmin + 1e-8)).numpy()
+        fi = torch.tensor(foundad_img_scores).numpy()
+        fi = (fi - fi.min()) / (fi.max() - fi.min() + 1e-8)
+        fp_all = torch.cat(foundad_pix_buf)
+        fp_min, fp_max = fp_all.min(), fp_all.max()
+        fp_norm = ((fp_all - fp_min) / (fp_max - fp_min + 1e-8)).numpy()
+
+        if pca_scorer is not None:
+            pi = torch.tensor(pca_img_scores).numpy()
+            pi = (pi - pi.min()) / (pi.max() - pi.min() + 1e-8)
+            pp_all = torch.cat(pca_pix_buf)
+            pp_min, pp_max = pp_all.min(), pp_all.max()
+            pp_norm = ((pp_all - pp_min) / (pp_max - pp_min + 1e-8)).numpy()
+            alpha = pca_weight
+            p_np = (1 - alpha) * fi + alpha * pi
+            pix_norm = (1 - alpha) * fp_norm + alpha * pp_norm
+        else:
+            p_np = fi
+            pix_norm = fp_norm
+
         mask_np = torch.cat(mask_buf).squeeze(1).numpy()
 
         met = compute_ad_metrics_gpu(

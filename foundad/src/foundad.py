@@ -23,10 +23,11 @@ class LinearProjector(torch.nn.Module):
 
 
 class VisionModule(nn.Module):
-    def __init__(self, model_name: str, pred_depth: int, pred_emb_dim: int, use_cuda: bool = True, if_pe: bool = True, feat_normed: bool = False):
+    def __init__(self, model_name: str, pred_depth: int, pred_emb_dim: int, use_cuda: bool = True, if_pe: bool = True, feat_normed: bool = False, multi_layer_agg: str = 'none'):
         super().__init__()
         (self.encoder, self.num_patches, self.embed_dim, self.processor, self.projector) = self._build_encoder(model_name)
         self.model_name = model_name
+        self.multi_layer_agg = multi_layer_agg
 
         self.predictor = vit.__dict__["vit_predictor"](num_patches=self.num_patches, embed_dim=self.embed_dim,
                                                          predictor_embed_dim=pred_emb_dim, depth=pred_depth, if_pe=if_pe, feat_normed=feat_normed)
@@ -80,11 +81,15 @@ class VisionModule(nn.Module):
 
     def _extract(self, imgs: torch.Tensor, paths: List[str], n_layer: int = 3):
         if self.model_name == "dinov2":
-            h = self.encoder.get_intermediate_layers(imgs, n=n_layer, return_class_token=False)[0] # the thrid last block
+            layers = self.encoder.get_intermediate_layers(imgs, n=n_layer, return_class_token=False)
+            h = torch.stack(layers).mean(0) if self.multi_layer_agg == 'mean' and len(layers) > 1 else layers[0]
         elif self.model_name == "dinov3":
-            h = self.encoder.get_intermediate_layers(imgs, n=n_layer, return_class_token=False)[0] 
+            layers = self.encoder.get_intermediate_layers(imgs, n=n_layer, return_class_token=False)
+            h = torch.stack(layers).mean(0) if self.multi_layer_agg == 'mean' and len(layers) > 1 else layers[0]
         elif self.model_name == "dino":
-            h = self.encoder.get_intermediate_layers(imgs, n=n_layer)[0][:,1:,:]
+            layers = self.encoder.get_intermediate_layers(imgs, n=n_layer)
+            stripped = [l[:, 1:, :] for l in layers]
+            h = torch.stack(stripped).mean(0) if self.multi_layer_agg == 'mean' and len(stripped) > 1 else stripped[0]
         elif self.model_name == "siglip":
             pil_list = [Image.open(p).convert("RGB") for p in paths]
             proc = self.processor(images=pil_list, return_tensors="pt")

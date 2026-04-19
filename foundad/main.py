@@ -76,6 +76,9 @@ def process_main(rank: int, cfg_dict: dict, world_size: int):
                 saved_params = yaml.safe_load(f)
                 assert cfg_dict['diy_name']==saved_params['diy_name']
                 params['meta'] = saved_params['meta']
+                saved_train_root = saved_params.get('data', {}).get('train_root')
+                if saved_train_root:
+                    params['data']['train_root'] = saved_train_root
                 params["ckpt_path"] = os.path.join(saved_params["logging"]["folder"],f"train-step{params['ckpt_step']}.pth.tar")
                 params["logging"]["folder"] = os.path.join(saved_params["logging"]["folder"],f"eval/{str(params['ckpt_step'])}")
             ad_eval(args=params)

@@ -34,6 +34,7 @@ class Trainer:
         mcfg = args["meta"]
         self.model = VisionModule(
             mcfg["model"], mcfg["pred_depth"], mcfg["pred_emb_dim"], if_pe=mcfg.get("if_pred_pe", True), feat_normed=mcfg.get("feat_normed", False),
+            multi_layer_agg=mcfg.get("multi_layer_agg", "none"),
         )
         self.n_layer = args["meta"].get("n_layer", 3)
         self.model.predictor.requires_grad_(True)

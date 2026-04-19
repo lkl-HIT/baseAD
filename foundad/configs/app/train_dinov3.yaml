@@ -9,6 +9,7 @@ meta:
   n_layer: 3
   feat_normed: false
   loss_mode: 'l2'  # l2 or smooth_l1
+  multi_layer_agg: 'none'  # 'none' = single layer (baseline), 'mean' = mean-pool last n_layer layers
 
 logging:
   folder: logs/${data.data_name}/${app.meta.model}${oc.select:diy_name,""}

@@ -82,6 +82,14 @@ testing:
   segmentation_vis: True
   # Resume AD eval: skip classes already present in *_eval.csv for this checkpoint
   skip_evaluated_classes: true
+  # Top-ratio aggregation: overrides K_top if set (e.g. 0.01 = top 1%)
+  top_ratio: null
+  # PCA auxiliary scoring (inference-only, works with existing checkpoints)
+  pca:
+    enabled: false
+    ev_ratio: 0.99        # explained variance threshold for selecting PCA components
+    score_weight: 0.3     # fusion weight for PCA score (0 = FoundAD only, 1 = PCA only)
+    n_aug: 3              # rotation augmentations per training image for PCA fitting
 
 devices: [cuda:0]
 
