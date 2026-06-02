@@ -9,4 +9,5 @@
 6.进行实验的时候，对于不同特性的修改，需要在不同的分支下进行，命名为feature_xxx
 7.运行环境为conda下的foundad
 8.采用编写bash脚本的方法进行实验，所有参数都放在bash脚本中，方便我通过 bash xxx.sh 来进行
-
+9.若遇到需要调codex进行审阅的场景，去掉xhigh这个参数，即为保持默认
+10.若遇到像看pdf格式论文的时候，调用mineru-pdf skills，得到md格式的论文后，再进行阅读
