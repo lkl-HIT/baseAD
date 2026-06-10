@@ -157,7 +157,7 @@ def train(args: argparse.Namespace) -> None:
 def _save_ckpt(model: DMFoundAD, log_dir: Path, gstep: int) -> None:
     state = {
         "seg_projectors": model.seg_projectors.state_dict(),
-        "cls_projectors": model.cls_projectors.state_dict(),
+        "cls_projector": model.cls_projector.state_dict() if model.cls_projector is not None else {},
         "step": gstep,
     }
     torch.save(state, log_dir / f"dm-step{gstep}.pth.tar")
@@ -193,8 +193,8 @@ def evaluate(args: argparse.Namespace) -> None:
     ckpt = log_dir / f"dm-step{args.ckpt_step}.pth.tar"
     state = torch.load(ckpt, map_location="cpu")
     model.seg_projectors.load_state_dict(state["seg_projectors"])
-    if cls_layers:
-        model.cls_projectors.load_state_dict(state["cls_projectors"])
+    if cls_layers and model.cls_projector is not None and "cls_projector" in state:
+        model.cls_projector.load_state_dict(state["cls_projector"])
     model.to(device)
     print(f"Loaded {ckpt}")
 
@@ -306,8 +306,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--crop", type=int, default=512)
     ap.add_argument("--seg_layers", default="1,4,7,10,13",
                     help="negative-from-last block indices for segmentation projectors")
-    ap.add_argument("--cls_layers", default="1",
-                    help="empty string '' disables CLS head; '1' = last block; '1,4' = last + 4th-from-last")
+    ap.add_argument("--cls_layers", default="1,4,7",
+                    help="empty string '' disables CLS head; '1' = last block; '1,4,7' = multi-layer CLS")
     ap.add_argument("--pred_depth", type=int, default=6)
     ap.add_argument("--pred_emb_dim", type=int, default=384)
     ap.add_argument("--cls_hidden", type=int, default=384)

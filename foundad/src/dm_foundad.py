@@ -52,28 +52,82 @@ def _build_projector(num_patches: int, embed_dim: int, pred_emb_dim: int,
     return pred
 
 
-class ClsProjector(nn.Module):
-    """Lightweight MLP projector for the CLS token (~D × pred_emb_dim × 2 params).
+class ClsViTProjector(nn.Module):
+    """ViT-style projector for multi-layer CLS tokens.
 
-    A 2-layer MLP with residual: keeps φ from collapsing to identity *only*
-    because we train it with image-level perturbation; without perturbation
-    `φ(x) = x` is the optimum.
+    Mirrors VisionTransformerPredictor (Seg Projector) structure:
+    - Bottleneck: embed_dim → pred_dim → embed_dim
+    - Positional encoding for layer ordering
+    - Self-Attention across layers (cross-layer interaction)
+    - Global residual connection
+
+    Unlike the old ClsProjector (2-layer MLP + residual shortcut),
+    this design forces the network to learn meaningful projections
+    because Self-Attention prevents per-token identity shortcut.
     """
 
-    def __init__(self, embed_dim: int, hidden: int = 384, depth: int = 2):
+    def __init__(
+        self,
+        num_cls_tokens: int,
+        embed_dim: int = 768,
+        predictor_embed_dim: int = 384,
+        depth: int = 2,
+        num_heads: int = 6,
+        mlp_ratio: float = 4.0,
+        if_pe: bool = True,
+        feat_normed: bool = False,
+    ):
         super().__init__()
-        layers: List[nn.Module] = [nn.LayerNorm(embed_dim), nn.Linear(embed_dim, hidden), nn.GELU()]
-        for _ in range(depth - 1):
-            layers += [nn.Linear(hidden, hidden), nn.GELU()]
-        layers += [nn.Linear(hidden, embed_dim)]
-        self.net = nn.Sequential(*layers)
-        for m in self.net.modules():
-            if isinstance(m, nn.Linear):
-                trunc_normal_(m.weight, std=0.02)
+        self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
+        self.if_pe = if_pe
+        if if_pe:
+            self.predictor_pos_embed = nn.Parameter(
+                torch.zeros(1, num_cls_tokens, predictor_embed_dim),
+                requires_grad=False,
+            )
+            trunc_normal_(self.predictor_pos_embed, std=0.02)
+        else:
+            self.predictor_pos_embed = None
+
+        from src.dinov2.layers import NestedTensorBlock as Block
+        self.predictor_blocks = nn.ModuleList([
+            Block(
+                dim=predictor_embed_dim,
+                num_heads=num_heads,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=True,
+                norm_layer=nn.LayerNorm,
+            )
+            for _ in range(depth)
+        ])
+        self.predictor_norm = nn.LayerNorm(predictor_embed_dim)
+        self.predictor_proj = nn.Linear(predictor_embed_dim, embed_dim, bias=True)
+        self.feat_normed = feat_normed
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.net(x)
+        """x: [B, num_cls_tokens, embed_dim] -> [B, num_cls_tokens, embed_dim]"""
+        B = x.size(0)
+        x = self.predictor_embed(x)
+        if self.predictor_pos_embed is not None:
+            x = x + self.predictor_pos_embed
+        residuals = x.clone()
+        for blk in self.predictor_blocks:
+            x = blk(x) + residuals
+        x = self.predictor_norm(x)
+        x = self.predictor_proj(x)
+        if self.feat_normed:
+            x = F.normalize(x, dim=-1)
+        return x
 
 
 class DMFoundAD(nn.Module):
@@ -127,10 +181,18 @@ class DMFoundAD(nn.Module):
                 for l in self.seg_layers
             })
 
-        self.cls_projectors = nn.ModuleDict({
-            str(l): ClsProjector(embed_dim, hidden=cls_hidden, depth=cls_depth)
-            for l in self.cls_layers
-        })
+        if self.cls_layers:
+            self.cls_projector = ClsViTProjector(
+                num_cls_tokens=len(self.cls_layers),
+                embed_dim=embed_dim,
+                predictor_embed_dim=cls_hidden,
+                depth=cls_depth,
+                num_heads=max(1, cls_hidden // 64),
+                if_pe=if_pe,
+                feat_normed=feat_normed,
+            )
+        else:
+            self.cls_projector = None
 
         self.dropout = nn.Dropout(0.2)
 
@@ -220,8 +282,9 @@ class DMFoundAD(nn.Module):
     def predict_patch(self, layer: int, z: torch.Tensor) -> torch.Tensor:
         return self.seg_projectors[str(layer)](z)
 
-    def predict_cls(self, layer: int, z: torch.Tensor) -> torch.Tensor:
-        return self.cls_projectors[str(layer)](z)
+    def predict_cls(self, z_stacked: torch.Tensor) -> torch.Tensor:
+        """Predict all CLS layers at once. z_stacked: [B, L, D] -> [B, L, D]"""
+        return self.cls_projector(z_stacked)
 
     # ----------------------------------------------------------------- train
     def training_step(
@@ -261,11 +324,12 @@ class DMFoundAD(nn.Module):
             loss_dict[f"seg_l{l}"] = l_seg.detach()
             total = total + l_seg
 
-        for l in self.cls_layers:
-            z = ctx_cls[l]
-            p = self.predict_cls(l, z)
-            l_cls = F.mse_loss(p, target_cls[l])
-            loss_dict[f"cls_l{l}"] = l_cls.detach()
+        if self.cls_layers:
+            ctx_cls_stack = torch.stack([ctx_cls[l] for l in self.cls_layers], dim=1)
+            target_cls_stack = torch.stack([target_cls[l] for l in self.cls_layers], dim=1)
+            p_cls = self.predict_cls(ctx_cls_stack)
+            l_cls = F.mse_loss(p_cls, target_cls_stack)
+            loss_dict["cls"] = l_cls.detach()
             total = total + l_cls
 
         loss_dict["total"] = total.detach()
@@ -293,16 +357,17 @@ class DMFoundAD(nn.Module):
         out["patch_per_layer"] = per_layer_patch
         out["patch_agg"] = torch.stack(list(per_layer_patch.values()), 0).mean(0)
 
-        per_layer_cls: Dict[int, torch.Tensor] = {}
-        for l in self.cls_layers:
-            z = target_cls[l]
-            p = self.predict_cls(l, z)
-            per_layer_cls[l] = F.mse_loss(p, z, reduction="none").mean(dim=1)
-        out["cls_per_layer"] = per_layer_cls
-        out["cls_agg"] = (
-            torch.stack(list(per_layer_cls.values()), 0).mean(0)
-            if per_layer_cls else imgs.new_zeros(imgs.size(0))
-        )
+        if self.cls_layers:
+            cls_stack = torch.stack([target_cls[l] for l in self.cls_layers], dim=1)
+            p_cls = self.predict_cls(cls_stack)
+            per_layer_cls = {}
+            for i, l in enumerate(self.cls_layers):
+                per_layer_cls[l] = F.mse_loss(p_cls[:, i], cls_stack[:, i], reduction="none").mean(dim=1)
+            out["cls_per_layer"] = per_layer_cls
+            out["cls_agg"] = torch.stack(list(per_layer_cls.values()), 0).mean(0)
+        else:
+            out["cls_per_layer"] = {}
+            out["cls_agg"] = imgs.new_zeros(imgs.size(0))
         return out
 
     # ----------------------------------------------------------------- params
@@ -311,7 +376,8 @@ class DMFoundAD(nn.Module):
         for p in self.seg_projectors.parameters():
             if p.requires_grad:
                 params.append(p)
-        for p in self.cls_projectors.parameters():
-            if p.requires_grad:
-                params.append(p)
+        if self.cls_projector is not None:
+            for p in self.cls_projector.parameters():
+                if p.requires_grad:
+                    params.append(p)
         return params
