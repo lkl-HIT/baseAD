@@ -341,9 +341,11 @@ def build_dataloader(
 
     if mode == "train":
         dataset = TrainDataset(root=root, **kwargs)
-        sampler = distributed.DistributedSampler(
-            dataset,
-        )
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            sampler = distributed.DistributedSampler(dataset)
+        else:
+            sampler = torch.utils.data.RandomSampler(dataset)
         drop_last = True
     elif mode == "test":
         dataset = TestDataset(source=root, **kwargs)

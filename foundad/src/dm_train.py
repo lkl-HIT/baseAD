@@ -113,7 +113,8 @@ def train(args: argparse.Namespace) -> None:
 
     gstep = 0
     for ep in range(args.epochs):
-        sampler.set_epoch(ep)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(ep)
         ep_loss, ep_n = 0.0, 0
         for itr, batch in enumerate(loader):
             imgs, labels, paths = batch

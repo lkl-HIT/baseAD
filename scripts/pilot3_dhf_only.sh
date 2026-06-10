@@ -18,7 +18,7 @@ EPOCHS="${EPOCHS:-2000}"
 SAVE_EVERY="${SAVE_EVERY:-1000}"
 BATCH="${BATCH:-8}"
 SEED="${SEED:-42}"
-SEG_LAYERS="${SEG_LAYERS:-1,4,7,10,13}"
+SEG_LAYERS="${SEG_LAYERS:-1,4,7,10,12}"
 
 if [ ! -d "$DATA_PATH/$DATA_NAME/train" ]; then
     echo "[setup] sampling few-shot folder ..."

@@ -93,7 +93,7 @@ def _build_transform(crop: int):
 def _load_dinov3(device: torch.device):
     enc = torch.hub.load(
         "/root/.cache/torch/hub/facebookresearch_dinov3_main",
-        "dinov3_vitl16",
+        "dinov3_vitb16",
         source="local",
     ).eval()
     for p in enc.parameters():

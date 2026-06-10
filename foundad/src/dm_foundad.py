@@ -146,7 +146,7 @@ class DMFoundAD(nn.Module):
         elif model == "dinov3":
             enc = torch.hub.load(
                 "/root/.cache/torch/hub/facebookresearch_dinov3_main",
-                "dinov3_vitl16", source="local",
+                "dinov3_vitb16", source="local",
             ).eval()
             num_patches, embed_dim = enc.patch_embed.num_patches, enc.embed_dim
         elif model == "dino":
